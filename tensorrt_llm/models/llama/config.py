@@ -133,6 +133,9 @@ class LLaMAConfig(PretrainedConfig):
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
         rotary_base = getattr(hf_config, "rope_theta", 10000.0)
         residual_mlp = getattr(hf_config, "parallel_attn_mlp_res", False)
+        moe_layers = getattr(hf_config, "moe_layers", None)
+        qk_layernorm = getattr(hf_config, "qk_layernorm", False)
+        duplicate_dense_pre_mlp_norm = getattr(hf_config, "duplicate_dense_pre_mlp_norm", False)
         disable_weight_only_quant_plugin = kwargs.pop(
             'disable_weight_only_quant_plugin', False)
         remove_duplicated_kv_heads = kwargs.pop('remove_duplicated_kv_heads',
@@ -168,6 +171,7 @@ class LLaMAConfig(PretrainedConfig):
             num_attention_heads=hf_config.num_attention_heads,
             hidden_size=hf_config.hidden_size,
             intermediate_size=hf_config.intermediate_size,
+            dense_ffn_hidden_size=hf_config.dense_ffn_hidden_size,
             num_key_value_heads=num_key_value_heads,
             head_size=head_size,
             vocab_size=hf_config.vocab_size,
@@ -184,6 +188,9 @@ class LLaMAConfig(PretrainedConfig):
             mapping=mapping,
             quantization=quant_config,
             remove_duplicated_kv_heads=remove_duplicated_kv_heads,
+            qk_layernorm=qk_layernorm,
+            duplicate_dense_pre_mlp_norm=duplicate_dense_pre_mlp_norm,
+            moe_layers=moe_layers,
             **kwargs)
 
     @classmethod

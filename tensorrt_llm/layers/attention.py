@@ -741,19 +741,39 @@ class Attention(Module):
                 concat([
                     base_shape, self.num_attention_heads, 3,
                     self.attention_head_size
-                ]))
-            query, key, value = split(qkv, 1, dim=qkv.ndim() - 2)
+                ]))  # (-1, 20, 3, 128)
+            query, key, value = split(qkv, 1, dim=qkv.ndim() - 2)  # (-1, 20, 1, 128)
             q_shape = concat([
                 base_shape, self.num_attention_heads, self.attention_head_size
-            ])
-            query = query.view(q_shape)
-            key = key.view(q_shape)
-            value = value.view(q_shape)
+            ])  # (-1, 20, 128)
+            query = query.view(q_shape)  # (-1, 20, 128)
+            key = key.view(q_shape)  # (-1, 20, 128)
+            value = value.view(q_shape)  # (-1, 20, 128)
 
-            query = self.q_layernorm(query)
-            key = self.k_layernorm(key)
+            query = self.q_layernorm(query)  # (-1, 20, 128)
+            key = self.k_layernorm(key)  # (-1, 20, 128)
             qkv = concat([query, key, value], dim=query.ndim() - 2)
             qkv = qkv.view(concat([base_shape, self.attention_hidden_size * 3]))
+        import pdb
+        pdb.set_trace()
+        # import pdb
+        # pdb.set_trace()
+        # kv_size = self.attention_head_size * self.num_attention_kv_heads
+        # query, key, value = split(
+        #     qkv, [self.attention_hidden_size, kv_size, kv_size], dim=-1)
+        # if self.qk_layernorm:
+        #     q_shape = query.shape
+        #     q_shape = concat([q_shape[0], q_shape[1] // self.num_attention_heads, self.num_attention_heads])
+        #     query = query.view(q_shape)
+        #     key = key.view(q_shape)
+        # 
+        #     query = self.q_layernorm(query)
+        #     key = self.k_layernorm(key)
+        # 
+        #     query = query.view((-1, 2560))
+        #     key = key.view((-1, 2560))
+        #     qkv = concat([query, key, value], dim=query.ndim() - 1)
+
         if self.position_embedding_type == PositionEmbeddingType.chatglm:
             qkv = RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm(
                 qkv,

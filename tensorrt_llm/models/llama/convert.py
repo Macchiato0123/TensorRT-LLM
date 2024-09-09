@@ -687,15 +687,18 @@ def get_prefix_and_param_name_map(architecture, use_safetensors=False):
             "ln_f": "norm" + key_postfix,  # ln_f
             "attention.qkv": "self_attn",  # attention.qkv
             "qkv_suffix": "_proj" + key_postfix,  # qkv suffix
-            "attention.dense":
-            "self_attn.o_proj" + key_postfix,  # attention.dense
-            "mlp.gate": "mlp.up_proj" + key_postfix,  # mlp.gate
-            "mlp.proj": "mlp.down_proj" + key_postfix,  # mlp.proj
-            "mlp.fc": "mlp.gate_proj" + key_postfix,  # mlp.fc
-            "input_layernorm":
-            "input_layernorm" + key_postfix,  # input_layernorm
-            "post_layernorm":
-            "post_attention_layernorm" + key_postfix,  # post_layernorm
+            "attention.dense": "self_attn.o_proj" + key_postfix,  # attention.dense
+            # "mlp.gate": "mlp.up_proj" + key_postfix,  # mlp.gate
+            # "mlp.proj": "mlp.down_proj" + key_postfix,  # mlp.proj
+            # "mlp.fc": "mlp.gate_proj" + key_postfix,  # mlp.fc
+            "mlp.gate": "mlp.w3" + key_postfix,  # mlp.gate
+            "mlp.proj": "mlp.w2" + key_postfix,  # mlp.proj
+            "mlp.fc": "mlp.w1" + key_postfix,  # mlp.fc
+            "input_layernorm": "input_layernorm" + key_postfix,  # input_layernorm
+            "post_layernorm": "post_attention_layernorm" + key_postfix,  # post_layernorm
+            "pre_mlp_layernorm": "pre_mlp_layernorm" + key_postfix,  # duplicate pre mlp rms_norm
+            "q_layernorm": "self_attn.q_layernorm" + key_postfix,  # q_layernorm
+            "k_layernorm": "self_attn.k_layernorm" + key_postfix,  # k_layernorm
         }
         layer_prefix = 'layers'
 
@@ -955,7 +958,8 @@ def load_weights_from_hf_model(hf_model,
                                        use_gemm_woq_plugin,
                                        use_fp8_rowwise=False))
 
-        if moe_config.has_moe():
+        is_interleaved_moe = True if (hasattr(config, "moe_layers") and config.moe_layers) else False
+        if (moe_config.has_moe() and not is_interleaved_moe) or (is_interleaved_moe and (l in config.moe_layers)):
             rank_experts = list(range(moe_config.num_experts))
             if mapping.has_moe_ep():
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
@@ -1638,7 +1642,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                         'attention.dense.per_channel_scale'] = torch_weight_scales
                 else:
                     weights[tllm_prex + 'attention.dense.weight'] = split_v
-            elif name.endswith('mlp.up_proj.weight'):
+            elif name.endswith('mlp.up_proj.weight') or name.endswith('mlp.w3.weight'):
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1661,7 +1665,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                             torch.float32)
                 else:
                     weights[tllm_prex + 'mlp.gate.weight'] = split_v
-            elif name.endswith('mlp.down_proj.weight'):
+            elif name.endswith('mlp.down_proj.weight') or name.endswith('mlp.w2.weight'):
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1685,7 +1689,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                 else:
                     weights[tllm_prex + 'mlp.proj.weight'] = split_v
 
-            elif name.endswith('mlp.gate_proj.weight'):
+            elif name.endswith('mlp.gate_proj.weight') or name.endswith('mlp.w1.weight'):
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1880,15 +1884,21 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         load_and_set(f'{tllm_prex}.attention.dense.weight',
                      prefix + param_name_map["attention.dense"],
                      1)  # attention.dense
+        if config.qk_layernorm:  # attention.q_layernorm, attention.k_layernorm
+            load_and_set(f'{tllm_prex}.attention.q_layernorm.weight', prefix + param_name_map["q_layernorm"], 0)
+            load_and_set(f'{tllm_prex}.attention.k_layernorm.weight', prefix + param_name_map["k_layernorm"], 0)
 
         # MLP
-        if not moe_config.has_moe():
+        if not moe_config.has_moe() or int(layer_idx) % 2 == 0:
+        # if not moe_config.has_moe():
             load_and_set(f'{tllm_prex}.mlp.gate.weight',
                          prefix + param_name_map["mlp.gate"], 0)  # mlp.gate
             load_and_set(f'{tllm_prex}.mlp.proj.weight',
                          prefix + param_name_map["mlp.proj"], 1)  # mlp.proj
             load_and_set(f'{tllm_prex}.mlp.fc.weight',
                          prefix + param_name_map["mlp.fc"], 0)  # mlp.fc
+            if config.duplicate_dense_pre_mlp_norm:  # duplicate RMSNorm layer before the MLP layers
+                load_and_set(f'{tllm_prex}.pre_mlp_layernorm.weight', prefix + param_name_map["pre_mlp_layernorm"])
 
         else:
             weights[f'{tllm_prex}.mlp.router.weight'] = load(
@@ -1954,11 +1964,16 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
         "self_attn.",  # attention.qkv
         "_proj",  # qkv suffix
         "self_attn.o_proj",  # attention.dense
-        "mlp.up_proj",  # mlp.gate
-        "mlp.down_proj",  # mlp.proj
-        "mlp.gate_proj",  # mlp.fc
+        # "mlp.up_proj",  # mlp.gate
+        # "mlp.down_proj",  # mlp.proj
+        # "mlp.gate_proj",  # mlp.fc
+        "mlp.w3.weight",  # mlp.gate
+        "mlp.w2.weight",  # mlp.proj
+        "mlp.w1.weight",  # mlp.fc
         "input_layernorm.weight",  # input_layernorm
         "post_attention_layernorm.weight",  # post_layernorm
+        "_layernorm.weight",  # qk_layernorm
+        "pre_mlp_layernorm.weight",  # duplicate pre mlp rms_norm
     ]
     split_sym = "."
 

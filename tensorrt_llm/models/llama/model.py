@@ -53,11 +53,11 @@ class LLaMADecoderLayer(Module):
         self.local_layer_idx = layer_idx - layers_range[0]
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
-            hidden_size=config.hidden_size,
-            attention_head_size=config.head_size,
-            num_attention_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            max_position_embeddings=config.max_position_embeddings,
+            hidden_size=config.hidden_size,  # 2560
+            attention_head_size=config.head_size,  # 128
+            num_attention_heads=config.num_attention_heads,  # 20
+            num_kv_heads=config.num_key_value_heads,  # 20
+            max_position_embeddings=config.max_position_embeddings,  # 2048
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
             bias=config.attn_bias,
@@ -67,21 +67,49 @@ class LLaMADecoderLayer(Module):
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             tp_rank=config.mapping.tp_rank,
-            quant_mode=config.quant_mode)
+            quant_mode=config.quant_mode,
+            qk_layernorm=config.qk_layernorm)
 
-        mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
+        self.duplicate_dense_pre_mlp_norm = False
+        is_interleaved_moe = True if (hasattr(config, "moe_layers") and config.moe_layers) else False
+        if is_interleaved_moe and self.local_layer_idx not in config.moe_layers:
+            mlp_hidden_size = config.hidden_size * 4 if config.dense_ffn_hidden_size is None else config.dense_ffn_hidden_size
+            if config.duplicate_dense_pre_mlp_norm:
+                self.duplicate_dense_pre_mlp_norm = True
+                self.pre_mlp_layernorm = RmsNorm(config.hidden_size,
+                                                 eps=config.norm_epsilon,
+                                                 dtype=config.dtype)
+        else:
+            mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
-        ClsMLP = GatedMLP
-        mlp_kwargs = {}
-        if config.moe.has_moe():
-            ClsMLP = MOE
-            mlp_kwargs = {
-                "moe_config": config.moe,
-                "mapping": config.mapping,
-            }
+        if is_interleaved_moe:
+            if self.local_layer_idx not in config.moe_layers:
+                ClsMLP = GatedMLP
+                # hidden_act = config.hidden_act
+                hidden_act = 'silu'
+                self.sparse = False
+                mlp_kwargs = {}
+            elif self.local_layer_idx in config.moe_layers:
+                ClsMLP = MOE
+                hidden_act = 'swiglu'
+                self.sparse = True
+                mlp_kwargs = {
+                    "moe_config": config.moe,
+                    "mapping": config.mapping,
+                }
+        else:
+            ClsMLP = GatedMLP
+            hidden_act = config.hidden_act
+            mlp_kwargs = {}
+            if config.moe.has_moe():
+                ClsMLP = MOE
+                mlp_kwargs = {
+                    "moe_config": config.moe,
+                    "mapping": config.mapping,
+                }
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,
-                          hidden_act=config.hidden_act,
+                          hidden_act=hidden_act,
                           dtype=config.dtype,
                           bias=config.mlp_bias,
                           tp_group=config.mapping.tp_group,
@@ -180,6 +208,9 @@ class LLaMADecoderLayer(Module):
                 residual = hidden_states
                 hidden_states = self.post_layernorm(hidden_states)
             if next_layer_input_layernorm_args is not None:
+                if self.duplicate_dense_pre_mlp_norm and not self.sparse:
+                    # print('pre mlp layernorm')
+                    hidden_states = self.pre_mlp_layernorm(hidden_states)
                 hidden_states = self.mlp(
                     hidden_states,
                     lora_layer_params=lora_layer_params,
@@ -191,6 +222,9 @@ class LLaMADecoderLayer(Module):
                         norm_weight=next_layer_input_layernorm_args[0],
                         eps=next_layer_input_layernorm_args[1]))
             else:
+                if self.duplicate_dense_pre_mlp_norm and not self.sparse:
+                    # print('pre mlp layernorm')
+                    hidden_states = self.pre_mlp_layernorm(hidden_states)
                 hidden_states = self.mlp(hidden_states,
                                          lora_layer_params=lora_layer_params)
                 hidden_states = residual + hidden_states
@@ -211,6 +245,8 @@ class LLaMAModel(Module):
                                              dtype=config.dtype)
 
         self.layers = DecoderLayerList(LLaMADecoderLayer, config)
+        import pdb
+        pdb.set_trace()
 
         if self.mapping.is_last_pp_rank():
             self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
@@ -325,42 +361,42 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                **kwargs)
         if config.remove_duplicated_kv_heads:
             config.num_key_value_heads = config.num_key_value_heads // 2
-        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
-            custom_dict = {}
-            if "llava" in hf_model_or_dir:
-                custom_dict = {
-                    "transformer": "language_model.model",
-                    "lm_head": "language_model.lm_head"
-                }
-            elif "vila" in hf_model_or_dir:
-                hf_model_dir += "/llm"
-            elif "exaone" in hf_model_or_dir:
-                custom_dict = {
-                    "transformer": "transformer",
-                    "layers": "h",
-                    "vocab_embedding": "wte",
-                    "lm_head": "lm_head",
-                    "ln_f": "ln_f",
-                    "attention": "attn.attention",
-                    "dense": "out_proj",
-                    "gate": "c_fc_1",
-                    "proj": "c_proj",
-                    "fc": "c_fc_0",
-                    "input_layernorm": "ln_1",
-                    "post_layernorm": "ln_2",
-                }
-            if quant_ckpt_path is not None:
-                hf_model_dir = quant_ckpt_path
-
-            # TODO(enweiz): check whether can enable share_embedding_table according to weights
-            if config.share_embedding_table:
-                logger.warning(
-                    f"{cls.__name__} does not support share_embedding_table; setting share_embedding_table=False."
-                )
-                config.share_embedding_table = False
-            model = cls(config)
-            loader = ModelWeightsLoader(hf_model_dir, custom_dict)
-            loader.generate_tllm_weights(model)
+        # if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        #     custom_dict = {}
+        #     if "llava" in hf_model_or_dir:
+        #         custom_dict = {
+        #             "transformer": "language_model.model",
+        #             "lm_head": "language_model.lm_head"
+        #         }
+        #     elif "vila" in hf_model_or_dir:
+        #         hf_model_dir += "/llm"
+        #     elif "exaone" in hf_model_or_dir:
+        #         custom_dict = {
+        #             "transformer": "transformer",
+        #             "layers": "h",
+        #             "vocab_embedding": "wte",
+        #             "lm_head": "lm_head",
+        #             "ln_f": "ln_f",
+        #             "attention": "attn.attention",
+        #             "dense": "out_proj",
+        #             "gate": "c_fc_1",
+        #             "proj": "c_proj",
+        #             "fc": "c_fc_0",
+        #             "input_layernorm": "ln_1",
+        #             "post_layernorm": "ln_2",
+        #         }
+        #     if quant_ckpt_path is not None:
+        #         hf_model_dir = quant_ckpt_path
+        # 
+        #     # TODO(enweiz): check whether can enable share_embedding_table according to weights
+        #     if config.share_embedding_table:
+        #         logger.warning(
+        #             f"{cls.__name__} does not support share_embedding_table; setting share_embedding_table=False."
+        #         )
+        #         config.share_embedding_table = False
+        #     model = cls(config)
+        #     loader = ModelWeightsLoader(hf_model_dir, custom_dict)
+        #     loader.generate_tllm_weights(model)
         else:
             if use_preloading:
                 assert not load_by_shard
